@@ -38,8 +38,9 @@ import (
 type completionAPIChatModel struct {
 	client *arkruntime.Client
 
-	tools    []tool
-	rawTools []*schema.ToolInfo
+	tools      []tool
+	rawTools   []*schema.ToolInfo
+	toolChoice *schema.ToolChoice
 
 	model            string
 	maxTokens        *int
@@ -56,6 +57,7 @@ type completionAPIChatModel struct {
 	thinking         *model.Thinking
 	cache            *CacheConfig
 	serviceTier      *string
+	reasoningEffort  *model.ReasoningEffort
 }
 
 type tool struct {
@@ -81,14 +83,16 @@ func (cm *completionAPIChatModel) Generate(ctx context.Context, in []*schema.Mes
 		TopP:        cm.topP,
 		Stop:        cm.stop,
 		Tools:       nil,
+		ToolChoice:  cm.toolChoice,
 	}, opts...)
 
-	arkOpts := fmodel.GetImplSpecificOptions(&arkOptions{
-		customHeaders: cm.customHeader,
-		thinking:      cm.thinking,
+	specOptions := fmodel.GetImplSpecificOptions(&arkOptions{
+		customHeaders:   cm.customHeader,
+		thinking:        cm.thinking,
+		reasoningEffort: cm.reasoningEffort,
 	}, opts...)
 
-	req, err := cm.genRequest(in, options, arkOpts)
+	req, err := cm.genRequest(in, options, specOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -109,8 +113,9 @@ func (cm *completionAPIChatModel) Generate(ctx context.Context, in []*schema.Mes
 	ctx = callbacks.OnStart(ctx, &fmodel.CallbackInput{
 		Messages: in,
 		Tools:    tools, // join tool info from call options
+		ToolChoice: options.ToolChoice,
 		Config:   reqConf,
-		Extra:    map[string]any{callbackExtraKeyThinking: arkOpts.thinking},
+		Extra:    map[string]any{callbackExtraKeyThinking: specOptions.thinking},
 	})
 
 	defer func() {
@@ -120,11 +125,11 @@ func (cm *completionAPIChatModel) Generate(ctx context.Context, in []*schema.Mes
 	}()
 
 	var resp model.ChatCompletionResponse
-	if arkOpts.cache != nil && arkOpts.cache.ContextID != nil {
-		resp, err = cm.client.CreateContextChatCompletion(ctx, *cm.convCompletionRequest(req, *arkOpts.cache.ContextID),
-			arkruntime.WithCustomHeaders(arkOpts.customHeaders))
+	if specOptions.cache != nil && specOptions.cache.ContextID != nil {
+		resp, err = cm.client.CreateContextChatCompletion(ctx, *cm.convCompletionRequest(req, *specOptions.cache.ContextID),
+			arkruntime.WithCustomHeaders(specOptions.customHeaders))
 	} else {
-		resp, err = cm.client.CreateChatCompletion(ctx, *req, arkruntime.WithCustomHeaders(arkOpts.customHeaders))
+		resp, err = cm.client.CreateChatCompletion(ctx, *req, arkruntime.WithCustomHeaders(specOptions.customHeaders))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create chat completion: %w", err)
@@ -139,7 +144,7 @@ func (cm *completionAPIChatModel) Generate(ctx context.Context, in []*schema.Mes
 		Message:    outMsg,
 		Config:     reqConf,
 		TokenUsage: cm.toModelCallbackUsage(outMsg.ResponseMeta),
-		Extra:      map[string]any{callbackExtraKeyThinking: arkOpts.thinking},
+		Extra:      map[string]any{callbackExtraKeyThinking: specOptions.thinking},
 	})
 
 	return outMsg, nil
@@ -157,6 +162,7 @@ func (cm *completionAPIChatModel) Stream(ctx context.Context, in []*schema.Messa
 		TopP:        cm.topP,
 		Stop:        cm.stop,
 		Tools:       nil,
+		ToolChoice:  cm.toolChoice,
 	}, opts...)
 
 	arkOpts := fmodel.GetImplSpecificOptions(&arkOptions{
@@ -186,10 +192,11 @@ func (cm *completionAPIChatModel) Stream(ctx context.Context, in []*schema.Messa
 	}
 
 	ctx = callbacks.OnStart(ctx, &fmodel.CallbackInput{
-		Messages: in,
-		Tools:    tools,
-		Config:   reqConf,
-		Extra:    map[string]any{callbackExtraKeyThinking: arkOpts.thinking},
+		Messages:   in,
+		Tools:      tools,
+		ToolChoice: options.ToolChoice,
+		Config:     reqConf,
+		Extra:      map[string]any{callbackExtraKeyThinking: arkOpts.thinking},
 	})
 	defer func() {
 		if err != nil {
@@ -285,6 +292,7 @@ func (cm *completionAPIChatModel) genRequest(in []*schema.Message, options *fmod
 		PresencePenalty:  cm.presencePenalty,
 		Thinking:         arkOpts.thinking,
 		ServiceTier:      cm.serviceTier,
+		ReasoningEffort:  arkOpts.reasoningEffort,
 	}
 
 	if cm.responseFormat != nil {
@@ -341,6 +349,21 @@ func (cm *completionAPIChatModel) genRequest(in []*schema.Message, options *fmod
 
 			req.Tools = append(req.Tools, arkTool)
 		}
+	}
+
+	if options.ToolChoice != nil {
+		var tc toolChoice
+		switch *options.ToolChoice {
+		case schema.ToolChoiceForbidden:
+			tc = toolChoiceNone
+		case schema.ToolChoiceAllowed:
+			tc = toolChoiceAuto
+		case schema.ToolChoiceForced:
+			tc = toolChoiceRequired
+		default:
+			tc = toolChoiceAuto
+		}
+		req.ToolChoice = tc
 	}
 
 	return req, nil
