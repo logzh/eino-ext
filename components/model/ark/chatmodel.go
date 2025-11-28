@@ -331,8 +331,10 @@ type ChatModel struct {
 }
 
 type CacheInfo struct {
-	// ContextID specifies the id of prefix that can be used with [WithCache] option.
+	// ContextID return by ContextAPI, it's specifies the id of prefix that can be used with [WithCache.ContextID] option.
 	ContextID string
+	// ResponseID return by ResponsesAPI, it's specifies the id of prefix that can be used with [WithCache.HeadPreviousResponseID] option.
+	ResponseID string
 	// Usage specifies the token usage of prefix
 	Usage schema.TokenUsage
 }
