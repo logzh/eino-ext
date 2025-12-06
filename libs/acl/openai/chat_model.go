@@ -195,6 +195,8 @@ type Client struct {
 	toolChoice *schema.ToolChoice
 }
 
+var otherReasoningKeys = []string{"reasoning"}
+
 var mimeType2AudioFormat = map[string]string{
 	"audio/wav":      "wav",
 	"audio/vnd.wav":  "wav",
@@ -218,7 +220,7 @@ var audioFormat2MimeTypes = map[string]string{
 
 func NewClient(ctx context.Context, config *Config) (*Client, error) {
 	if config == nil {
-		return nil, fmt.Errorf("OpenAI client config cannot be nil")
+		return nil, fmt.Errorf("client config cannot be nil")
 	}
 
 	var clientConf openai.ClientConfig
@@ -238,9 +240,10 @@ func NewClient(ctx context.Context, config *Config) (*Client, error) {
 		}
 	}
 
-	clientConf.HTTPClient = config.HTTPClient
-	if clientConf.HTTPClient == nil {
+	if config.HTTPClient == nil {
 		clientConf.HTTPClient = http.DefaultClient
+	} else {
+		clientConf.HTTPClient = config.HTTPClient
 	}
 
 	return &Client{
@@ -802,6 +805,15 @@ func (c *Client) Generate(ctx context.Context, in []*schema.Message, opts ...mod
 		if len(msg.ReasoningContent) > 0 {
 			outMsg.ReasoningContent = msg.ReasoningContent
 			setReasoningContent(outMsg, msg.ReasoningContent)
+		} else if msg.ExtraFields != nil {
+			for _, key := range otherReasoningKeys {
+				if reasoningRawMessage, ok := msg.ExtraFields[key]; ok && len(reasoningRawMessage) > 0 && string(reasoningRawMessage) != "null" {
+					msg.ReasoningContent = string(reasoningRawMessage)
+					setReasoningContent(outMsg, string(reasoningRawMessage))
+					break
+
+				}
+			}
 		}
 
 		if msg.Audio != nil && (msg.Audio.Data != "" || msg.Audio.Transcript != "") {
@@ -881,7 +893,7 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 
 	builder := newStreamMessageBuilder(c.config.Audio)
 
-	go func() {
+	go func(ctx_ context.Context) {
 		defer func() {
 			panicErr := recover()
 			_ = stream.Close()
@@ -899,8 +911,9 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 			chunk, chunkErr := stream.Recv()
 			if errors.Is(chunkErr, io.EOF) {
 				if specOptions.ResponseChunkMessageModifier != nil {
-					lastEmptyMsg, err = specOptions.ResponseChunkMessageModifier(ctx, lastEmptyMsg, chunk.RawBody, true)
-					if err != nil {
+					var err_ error
+					lastEmptyMsg, err_ = specOptions.ResponseChunkMessageModifier(ctx_, lastEmptyMsg, nil, true)
+					if err_ != nil {
 						sw.Send(nil, fmt.Errorf("failed to modify chunk message: %w", err))
 						return
 					}
@@ -916,7 +929,7 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 			}
 
 			if chunkErr != nil {
-				_ = sw.Send(nil, fmt.Errorf("failed to receive stream chunk from OpenAI: %w", chunkErr))
+				_ = sw.Send(nil, fmt.Errorf("failed to receive stream chunk: %w", chunkErr))
 				return
 			}
 
@@ -954,9 +967,10 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 			lastEmptyMsg = nil
 
 			if specOptions.ResponseChunkMessageModifier != nil {
-				msg, err = specOptions.ResponseChunkMessageModifier(ctx, msg, chunk.RawBody, false)
-				if err != nil {
-					sw.Send(nil, fmt.Errorf("failed to modify chunk message: %w", err))
+				var err_ error
+				msg, err_ = specOptions.ResponseChunkMessageModifier(ctx_, msg, chunk.RawBody, false)
+				if err_ != nil {
+					sw.Send(nil, fmt.Errorf("failed to modify chunk message: %w", err_))
 					return
 				}
 			}
@@ -972,7 +986,7 @@ func (c *Client) Stream(ctx context.Context, in []*schema.Message,
 			}
 		}
 
-	}()
+	}(ctx)
 
 	ctx, nsr := callbacks.OnEndWithStreamOutput(ctx, schema.StreamReaderWithConvert(sr,
 		func(src *model.CallbackOutput) (callbacks.CallbackOutput, error) {
@@ -1125,6 +1139,16 @@ func (b *streamMessageBuilder) build(resp openai.ChatCompletionStreamResponse) (
 		if len(choice.Delta.ReasoningContent) > 0 {
 			msg.ReasoningContent = choice.Delta.ReasoningContent
 			setReasoningContent(msg, choice.Delta.ReasoningContent)
+		} else if choice.Delta.ExtraFields != nil {
+			for _, key := range otherReasoningKeys {
+				if reasoningRawMessage, ok := choice.Delta.ExtraFields[key]; ok && len(reasoningRawMessage) > 0 && string(reasoningRawMessage) != "null" {
+					msg.ReasoningContent = string(reasoningRawMessage)
+					setReasoningContent(msg, string(reasoningRawMessage))
+					break
+
+				}
+			}
+
 		}
 
 		if choice.Delta.Audio != nil {
