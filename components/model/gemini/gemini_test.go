@@ -51,6 +51,11 @@ func TestGemini(t *testing.T) {
 					},
 				},
 			},
+			UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+				TotalTokenCount:      100,
+				ThoughtsTokenCount:   50,
+				CandidatesTokenCount: 50,
+			},
 		}, nil).Build().UnPatch()
 
 		resp, err := model.Generate(ctx, []*schema.Message{
@@ -62,6 +67,8 @@ func TestGemini(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "Hello, how can I help you?", resp.Content)
 		assert.Equal(t, schema.Assistant, resp.Role)
+		assert.Equal(t, 100, resp.ResponseMeta.Usage.TotalTokens)
+		assert.Equal(t, 50, resp.ResponseMeta.Usage.CompletionTokensDetails.ReasoningTokens)
 	})
 	mockey.PatchConvey("stream", t, func() {
 		respList := []*genai.GenerateContentResponse{
@@ -1022,4 +1029,12 @@ func TestCreatePrefixCache(t *testing.T) {
 		assert.Nil(t, generateConf.SystemInstruction)
 		assert.Len(t, generateConf.Tools, 0)
 	})
+}
+
+func TestChatModel_convSchemaMessage(t *testing.T) {
+	cm := &ChatModel{}
+	content, err := cm.convSchemaMessage(&schema.Message{Role: schema.System, Content: "sys"})
+	assert.Nil(t, err)
+	assert.Equal(t, 1, len(content.Parts))
+
 }
