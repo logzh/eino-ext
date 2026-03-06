@@ -28,6 +28,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/eino-contrib/jsonschema"
+	"github.com/google/uuid"
 	"google.golang.org/genai"
 
 	"github.com/cloudwego/eino/callbacks"
@@ -222,7 +223,7 @@ func (cm *ChatModel) Generate(ctx context.Context, input []*schema.Message, opts
 	}
 
 	// Convert the API response to schema.Message format
-	message, err = convResponse(result, make(map[string]int))
+	message, err = convResponse(result)
 	if err != nil {
 		return nil, fmt.Errorf("convert response fail: %w", err)
 	}
@@ -275,24 +276,22 @@ func (cm *ChatModel) Stream(ctx context.Context, input []*schema.Message, opts .
 				_ = sw.Send(nil, newPanicErr(pe, debug.Stack()))
 			}
 			sw.Close()
-	}()
-	// Track tool call IDs to generate unique identifiers for each tool call
-	toolCallIDs := make(map[string]int)
-	for resp, err_ := range resultIter {
-		if err_ != nil {
-			sw.Send(nil, err_)
-			return
+		}()
+		for resp, err_ := range resultIter {
+			if err_ != nil {
+				sw.Send(nil, err_)
+				return
+			}
+			message, err_ := convResponse(resp)
+			if err_ != nil {
+				sw.Send(nil, err_)
+				return
+			}
+			closed := sw.Send(convCallbackOutput(message, cbConf), nil)
+			if closed {
+				return
+			}
 		}
-		message, err_ := convResponse(resp, toolCallIDs)
-		if err_ != nil {
-			sw.Send(nil, err_)
-			return
-		}
-		closed := sw.Send(convCallbackOutput(message, cbConf), nil)
-		if closed {
-			return
-		}
-	}
 	}()
 	srList := sr.Copy(2)
 	callbacks.OnEndWithStreamOutput(ctx, srList[0])
@@ -785,25 +784,28 @@ func convSchemaMessage(message *schema.Message) (*genai.Content, error) {
 		content.Parts = append(content.Parts, thoughtPart)
 	}
 
-	for i := range message.ToolCalls {
-		call := &message.ToolCalls[i]
-		args := make(map[string]any)
-		err := sonic.UnmarshalString(call.Function.Arguments, &args)
-		if err != nil {
-			return nil, fmt.Errorf("unmarshal schema tool call arguments to map[string]any fail: %w", err)
-		}
+	addToolCallPart := func() error {
+		for i := range message.ToolCalls {
+			call := &message.ToolCalls[i]
+			args := make(map[string]any)
+			err := sonic.UnmarshalString(call.Function.Arguments, &args)
+			if err != nil {
+				return fmt.Errorf("unmarshal schema tool call arguments to map[string]any fail: %w", err)
+			}
 
-		part := genai.NewPartFromFunctionCall(call.Function.Name, args)
-		// Restore thought signature on the functionCall part if present.
-		// Per Gemini docs (https://cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures):
-		// - Signatures must be returned exactly as received on functionCall parts
-		// - For parallel calls: only first functionCall has signature
-		// - For sequential calls: each functionCall has its own signature
-		// - Omitting required signature causes 400 error on Gemini 3 Pro
-		if sig := getToolCallThoughtSignature(call); len(sig) > 0 {
-			part.ThoughtSignature = sig
+			part := genai.NewPartFromFunctionCall(call.Function.Name, args)
+			// Restore thought signature on the functionCall part if present.
+			// Per Gemini docs (https://cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures):
+			// - Signatures must be returned exactly as received on functionCall parts
+			// - For parallel calls: only first functionCall has signature
+			// - For sequential calls: each functionCall has its own signature
+			// - Omitting required signature causes 400 error on Gemini 3 Pro
+			if sig := getToolCallThoughtSignature(call); len(sig) > 0 {
+				part.ThoughtSignature = sig
+			}
+			content.Parts = append(content.Parts, part)
 		}
-		content.Parts = append(content.Parts, part)
+		return nil
 	}
 
 	if len(message.UserInputMultiContent) > 0 && len(message.AssistantGenMultiContent) > 0 {
@@ -828,6 +830,9 @@ func convSchemaMessage(message *schema.Message) (*genai.Content, error) {
 			return nil, err
 		}
 		content.Parts = append(content.Parts, parts...)
+		if err = addToolCallPart(); err != nil {
+			return nil, err
+		}
 		return content, nil
 	}
 	if message.Content != "" {
@@ -842,6 +847,9 @@ func convSchemaMessage(message *schema.Message) (*genai.Content, error) {
 			}
 		}
 		content.Parts = append(content.Parts, textPart)
+	}
+	if err := addToolCallPart(); err != nil {
+		return nil, err
 	}
 	if len(message.MultiContent) > 0 {
 		log.Printf("MultiContent field is deprecated, please use UserInputMultiContent or AssistantGenMultiContent instead")
@@ -1119,12 +1127,12 @@ func decodeBase64Data(dataURL string) ([]byte, error) {
 	return decoded, nil
 }
 
-func convResponse(resp *genai.GenerateContentResponse, toolCallIDs map[string]int) (*schema.Message, error) {
+func convResponse(resp *genai.GenerateContentResponse) (*schema.Message, error) {
 	if len(resp.Candidates) == 0 {
 		return nil, fmt.Errorf("gemini result is empty")
 	}
 
-	message, err := convCandidate(resp.Candidates[0], toolCallIDs)
+	message, err := convCandidate(resp.Candidates[0])
 	if err != nil {
 		return nil, fmt.Errorf("convert candidate fail: %w", err)
 	}
@@ -1148,7 +1156,7 @@ func convResponse(resp *genai.GenerateContentResponse, toolCallIDs map[string]in
 	return message, nil
 }
 
-func convCandidate(candidate *genai.Candidate, toolCallIDs map[string]int) (*schema.Message, error) {
+func convCandidate(candidate *genai.Candidate) (*schema.Message, error) {
 	result := &schema.Message{
 		ResponseMeta: &schema.ResponseMeta{
 			FinishReason: string(candidate.FinishReason),
@@ -1197,7 +1205,7 @@ func convCandidate(candidate *genai.Candidate, toolCallIDs map[string]int) (*sch
 				outParts = append(outParts, outPart)
 			}
 			if part.FunctionCall != nil {
-				fc, err := convFC(part, toolCallIDs)
+				fc, err := convFC(part)
 				if err != nil {
 					return nil, err
 				}
@@ -1288,7 +1296,9 @@ func toMultiOutPart(part *genai.Part) (schema.MessageOutputPart, error) {
 	return res, nil
 }
 
-func convFC(part *genai.Part, toolCallIDs map[string]int) (*schema.ToolCall, error) {
+// convFC converts a Gemini function call part to a schema.ToolCall.
+// Note: Gemini does not provide tool call IDs, so we generate a UUID for compatibility.
+func convFC(part *genai.Part) (*schema.ToolCall, error) {
 	if part == nil || part.FunctionCall == nil {
 		return nil, fmt.Errorf("part or function call is nil")
 	}
@@ -1299,19 +1309,8 @@ func convFC(part *genai.Part, toolCallIDs map[string]int) (*schema.ToolCall, err
 		return nil, fmt.Errorf("marshal gemini tool call arguments fail: %w", err)
 	}
 
-	// Generate a unique call ID for the tool call
-	// For the first call to a tool, use the tool name as the ID
-	// For subsequent calls, append a counter to make it unique
-	callID := tp.Name
-	if count, ok := toolCallIDs[tp.Name]; !ok {
-		toolCallIDs[tp.Name] = 1
-	} else {
-		callID = fmt.Sprintf("%s-%d", tp.Name, count+1)
-		toolCallIDs[tp.Name] = count + 1
-	}
-
 	toolCall := &schema.ToolCall{
-		ID: callID,
+		ID: uuid.NewString(),
 		Function: schema.FunctionCall{
 			Name:      tp.Name,
 			Arguments: args,
